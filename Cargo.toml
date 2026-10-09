@@ -1,0 +1,15 @@
+[package]
+name = "tu-audi-max-livestream"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+reqwest = "0.13.5"
+log = "0.4.34"
+simple_logger = "5.2.0"
+m3u8-rs = "6.0.1"
+bytes = "1.12.1"
+rand = "0.10.3"
+anyhow = "1.0.104"
+base64 = "0.23.1"
