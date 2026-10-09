@@ -6,6 +6,7 @@ mod rtsp;
 use std::{sync::Arc, time::Duration};
 
 use bytes::Bytes;
+use log::info;
 use demux::{CLOCK, Demuxer, Frame, StreamInfo};
 use tokio::{
     sync::{broadcast, mpsc, watch},
@@ -42,6 +43,8 @@ async fn pipeline(
 ) {
     let mut demuxer = Demuxer::new(info_tx);
     let mut anchor: Option<(Instant, u64)> = None;
+    let (mut max_nal, mut max_frame) = (0, 0);
+    let mut last_log = Instant::now();
 
     while let Some(segment) = segments.recv().await {
         for frame in demuxer.push_segment(&segment) {
@@ -56,6 +59,14 @@ async fn pipeline(
                 target = now;
             }
             sleep_until(target).await;
+            if let Frame::Video { nals, .. } = &frame {
+                max_nal = max_nal.max(nals.iter().map(Bytes::len).max().unwrap_or(0));
+                max_frame = max_frame.max(nals.iter().map(Bytes::len).sum::<usize>());
+                if last_log.elapsed() >= Duration::from_secs(5) {
+                    info!("video: largest NAL {max_nal} B, largest frame {max_frame} B (last 5s)");
+                    (max_nal, max_frame, last_log) = (0, 0, Instant::now());
+                }
+            }
             // No receivers is fine: nobody is watching.
             let _ = frames.send(Arc::new(frame));
         }

@@ -59,6 +59,10 @@ pub struct Demuxer {
     sps: Option<Bytes>,
     pps: Option<Bytes>,
     audio: Option<AudioInfo>,
+    /// Elementary stream bytes of the video access unit being assembled; large frames span
+    /// several PES packets, only the first of which is guaranteed to carry a PTS.
+    video_buf: Vec<u8>,
+    video_pts: u64,
     info_tx: watch::Sender<Option<Arc<StreamInfo>>>,
 }
 
@@ -71,6 +75,8 @@ impl Demuxer {
             sps: None,
             pps: None,
             audio: None,
+            video_buf: Vec::new(),
+            video_pts: 0,
             info_tx,
         }
     }
@@ -164,28 +170,53 @@ impl Demuxer {
     }
 
     fn finish(&mut self, pid: u16, kind: Kind, buf: &[u8], out: &mut Vec<Frame>) {
-        if buf.len() < 14 || buf[..3] != [0, 0, 1] || buf[7] & 0x80 == 0 {
+        if buf.len() < 9 || buf[..3] != [0, 0, 1] {
             return;
         }
         let start = 9 + buf[8] as usize;
         if buf.len() < start {
             return;
         }
-        let b = &buf[9..14];
-        let raw = (((b[0] as u64 >> 1) & 7) << 30)
-            | ((b[1] as u64) << 22)
-            | ((b[2] as u64 >> 1) << 15)
-            | ((b[3] as u64) << 7)
-            | (b[4] as u64 >> 1);
-        let pes = self.pes.entry(pid).or_default();
-        let pts = unwrap_pts(pes.last_pts, raw);
-        pes.last_pts = pts;
+        let pts = (buf[7] & 0x80 != 0 && buf.len() >= 14).then(|| {
+            let b = &buf[9..14];
+            let raw = (((b[0] as u64 >> 1) & 7) << 30)
+                | ((b[1] as u64) << 22)
+                | ((b[2] as u64 >> 1) << 15)
+                | ((b[3] as u64) << 7)
+                | (b[4] as u64 >> 1);
+            let pes = self.pes.entry(pid).or_default();
+            pes.last_pts = unwrap_pts(pes.last_pts, raw);
+            pes.last_pts
+        });
 
         match kind {
-            Kind::Video => self.video(pts, &buf[start..], out),
-            Kind::Audio => self.audio(pts, &buf[start..], out),
+            Kind::Video => match pts {
+                // A new PTS starts a new access unit; PES without one continue the current.
+                Some(pts) if pts != self.video_pts || self.video_buf.is_empty() => {
+                    self.flush_video(out);
+                    self.video_pts = pts;
+                    self.video_buf.extend_from_slice(&buf[start..]);
+                }
+                Some(_) => self.video_buf.extend_from_slice(&buf[start..]),
+                None if !self.video_buf.is_empty() => {
+                    self.video_buf.extend_from_slice(&buf[start..])
+                }
+                None => {}
+            },
+            Kind::Audio => {
+                if let Some(pts) = pts {
+                    self.audio(pts, &buf[start..], out);
+                }
+            }
         }
         self.publish();
+    }
+
+    fn flush_video(&mut self, out: &mut Vec<Frame>) {
+        let data = std::mem::take(&mut self.video_buf);
+        if !data.is_empty() {
+            self.video(self.video_pts, &data, out);
+        }
     }
 
     fn video(&mut self, pts: u64, data: &[u8], out: &mut Vec<Frame>) {
@@ -316,6 +347,42 @@ mod tests {
         let d = [0, 0, 0, 1, 0x67, 1, 2, 0, 0, 1, 0x68, 3, 0, 0, 0, 1, 0x65, 4];
         let nals = split_nals(&d);
         assert_eq!(nals, vec![&[0x67, 1, 2][..], &[0x68, 3][..], &[0x65, 4][..]]);
+    }
+
+    fn pes(pts: Option<u64>, payload: &[u8]) -> Vec<u8> {
+        let mut p = vec![0, 0, 1, 0xe0, 0, 0, 0x80];
+        match pts {
+            Some(t) => p.extend_from_slice(&[
+                0x80,
+                5,
+                0x21 | (((t >> 30) & 7) << 1) as u8,
+                (t >> 22) as u8,
+                (((t >> 15) & 0x7f) << 1) as u8 | 1,
+                (t >> 7) as u8,
+                ((t & 0x7f) << 1) as u8 | 1,
+            ]),
+            None => p.extend_from_slice(&[0, 0]),
+        }
+        p.extend_from_slice(payload);
+        p
+    }
+
+    #[test]
+    fn reassembles_frame_split_over_pes_packets() {
+        let (tx, _rx) = watch::channel(None);
+        let mut d = Demuxer::new(tx);
+        let mut out = Vec::new();
+        let slice: Vec<u8> = (1..=200u8).collect();
+
+        let first = [&[0, 0, 0, 1, 0x65][..], &slice[..100]].concat();
+        d.finish(0x100, Kind::Video, &pes(Some(9000), &first), &mut out);
+        d.finish(0x100, Kind::Video, &pes(None, &slice[100..]), &mut out);
+        assert!(out.is_empty());
+        d.finish(0x100, Kind::Video, &pes(Some(12000), &[0, 0, 0, 1, 0x41, 1]), &mut out);
+
+        let [Frame::Video { pts, idr, nals }] = &out[..] else { panic!("expected one frame") };
+        assert_eq!((*pts, *idr, nals.len()), (9000, true, 1));
+        assert_eq!(&nals[0][..], &[&[0x65][..], &slice[..]].concat()[..]);
     }
 
     #[test]
